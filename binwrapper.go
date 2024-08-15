@@ -3,6 +3,9 @@
 package binwrapper
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -16,8 +19,6 @@ import (
 	"runtime"
 	"strings"
 	"time"
-
-	archiver "github.com/mholt/archiver/v3"
 )
 
 // Src defines executable source
@@ -34,8 +35,8 @@ type BinWrapper struct {
 	dest     string
 	execPath string
 	strip    int
-	output   []byte
-	autoExe  bool
+	// output   []byte
+	autoExe bool
 
 	stdErr       []byte
 	stdOut       []byte
@@ -218,7 +219,7 @@ func (b *BinWrapper) Reset() *BinWrapper {
 // Arg list is appended to args set through Arg method
 // Returns context.DeadlineExceeded in case of timeout
 func (b *BinWrapper) Run(arg ...string) error {
-	if b.src != nil && len(b.src) > 0 {
+	if b != nil && len(b.src) > 0 {
 		err := b.findExisting()
 
 		if err != nil {
@@ -273,10 +274,10 @@ func (b *BinWrapper) Run(arg ...string) error {
 	}
 
 	if stdout != nil {
-		b.stdOut, _ = ioutil.ReadAll(stdout)
+		b.stdOut, _ = io.ReadAll(stdout)
 	}
 
-	b.stdErr, _ = ioutil.ReadAll(stderr)
+	b.stdErr, _ = io.ReadAll(stderr)
 	err = b.cmd.Wait()
 
 	if ctx.Err() == context.DeadlineExceeded {
@@ -312,7 +313,7 @@ func (b *BinWrapper) download() error {
 	src := osFilterObj(b.src)
 
 	if src == nil {
-		return errors.New("No binary found matching your system. It's probably not supported")
+		return errors.New("no binary found matching your system. It's probably not supported")
 	}
 
 	file, err := b.downloadFile(src.url)
@@ -339,7 +340,7 @@ func (b *BinWrapper) download() error {
 func (b *BinWrapper) extractFile(file string) error {
 
 	defer os.Remove(file)
-	err := archiver.Unarchive(file, b.dest)
+	err := SafeUnarchive(file, b.dest)
 
 	if err != nil {
 		fmt.Printf("%s is not an archive or have unsupported archive format\n", file)
@@ -452,4 +453,109 @@ func (b *BinWrapper) downloadFile(value string) (string, error) {
 	_, err = io.Copy(file, resp.Body)
 
 	return fileName, err
+}
+
+func SafeUnarchive(source, destination string) error {
+	file, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	var fileReader io.ReadCloser
+	if strings.HasSuffix(source, ".gz") {
+		fileReader, err = gzip.NewReader(file)
+		if err != nil {
+			return err
+		}
+		defer fileReader.Close()
+	} else if strings.HasSuffix(source, ".tar") {
+		fileReader = file
+	} else if strings.HasSuffix(source, ".zip") {
+		fi, err := file.Stat()
+		if err != nil {
+			return err
+		}
+		zipReader, err := zip.NewReader(file, fi.Size())
+		if err != nil {
+			return err
+		}
+
+		// Iterate through the files in the archive,
+		// extracting them to the destination directory
+		for _, zipEntry := range zipReader.File {
+			targetPath := filepath.Join(destination, zipEntry.Name)
+			if !strings.HasPrefix(targetPath, filepath.Clean(destination)+string(os.PathSeparator)) {
+				continue // Prevent path traversal attacks
+			}
+
+			if zipEntry.FileInfo().IsDir() {
+				// Create directory
+				if err := os.MkdirAll(targetPath, os.ModePerm); err != nil {
+					return err
+				}
+			} else {
+				// Create file
+				if err := os.MkdirAll(filepath.Dir(targetPath), os.ModePerm); err != nil {
+					return err
+				}
+				outFile, err := os.Create(targetPath)
+				if err != nil {
+					return err
+				}
+				defer outFile.Close()
+
+				f, err := zipEntry.Open()
+				if err != nil {
+					return err
+				}
+				defer f.Close()
+
+				if _, err := io.Copy(outFile, f); err != nil {
+					return err
+				}
+			}
+		}
+		return nil // Successfully extracted zip
+	} else {
+		return errors.New("unsupported file format")
+	}
+
+	// If it's a .tar.gz file, we proceed to unpack the tar after reading the gz
+	if fileReader != nil {
+		tarReader := tar.NewReader(fileReader)
+		for {
+			header, err := tarReader.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return err
+			}
+
+			target := filepath.Join(destination, filepath.FromSlash(header.Name))
+			if !strings.HasPrefix(target, filepath.Clean(destination)+string(os.PathSeparator)) {
+				continue // skip if the file path is not under the destination directory
+			}
+
+			switch header.Typeflag {
+			case tar.TypeDir:
+				if err := os.MkdirAll(target, os.FileMode(header.Mode)); err != nil {
+					return err
+				}
+			case tar.TypeReg:
+				outFile, err := os.Create(target)
+				if err != nil {
+					return err
+				}
+				if _, err := io.Copy(outFile, tarReader); err != nil {
+					outFile.Close()
+					return err
+				}
+				outFile.Close()
+			}
+		}
+	}
+
+	return nil
 }
